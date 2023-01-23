@@ -12,12 +12,13 @@ from scipy.optimize import newton
 
 from capytaine.meshes.collections import CollectionOfMeshes
 from capytaine.bem.airy_waves import airy_waves_velocity, froude_krylov_force
+from capytaine.bem.velocity_potential import compute_vel_vector
 
 LOG = logging.getLogger(__name__)
 
 _default_parameters = {'rho': 1000.0, 'g': 9.81, 'omega': 1.0,
                       'free_surface': 0.0, 'water_depth': np.infty,
-                      'wave_direction': 0.0}
+                      'forward_speed':0.0,'wave_direction': 0.0}
 
 
 class LinearPotentialFlowProblem:
@@ -39,7 +40,8 @@ class LinearPotentialFlowProblem:
         The acceleration of gravity in m/s2 (default: 9.81)
     boundary_condition: np.ndarray of shape (body.mesh.nb_faces,)
         The Neumann boundary condition on the floating body
-
+    forward_speed: float, optional
+        Rigid body forward speed in m/s (default: 0.0)
     TODO: more consistent use of free_surface and sea_bottom vs. water_depth
     """
 
@@ -50,6 +52,7 @@ class LinearPotentialFlowProblem:
                  omega=_default_parameters['omega'],
                  rho=_default_parameters['rho'],
                  g=_default_parameters['g'],
+                 forward_speed =_default_parameters['forward_speed'],
                  boundary_condition=None):
 
         self.body = body
@@ -58,6 +61,7 @@ class LinearPotentialFlowProblem:
         self.omega = float(omega)
         self.rho = float(rho)
         self.g = float(g)
+        self.forward_speed=float(forward_speed)
         self.boundary_condition = boundary_condition
 
         self._check_data()
@@ -124,7 +128,8 @@ class LinearPotentialFlowProblem:
                 "water_depth": self.water_depth,
                 "omega": self.omega,
                 "rho": self.rho,
-                "g": self.g}
+                "g": self.g,
+                "forward_speed":self.forward_speed}
 
     @staticmethod
     def _group_for_parallel_resolution(problems):
@@ -197,6 +202,45 @@ class LinearPotentialFlowProblem:
             return 2*np.pi/self.wavenumber
 
     @property
+    def wavlen(self):
+        Periods=[2*np.pi/self.omega]
+        Depth=self.water_depth 
+        L=np.zeros(len(Periods))
+        d=Depth
+        mm=0
+        for T in Periods:
+            g = 9.81
+            dpi = 2*np.pi
+            
+            L0 = g*T**2/dpi
+            L1 = g*T**2/dpi*np.tanh(dpi*d/L0)
+            
+            while (np.abs(L1-L0) > 0.001):
+                L0 = L1
+                L1 = g*T**2/dpi*np.tanh(dpi*d/L0)
+
+            L[mm]=L1
+            mm=mm+1
+        
+        return L[0]   
+    
+    @property
+    def omega_e(self):
+        #encountered frequency
+        Lo=self.wavlen
+        ko=2*np.pi/Lo
+        # return self.omega - self.omega**2/self.g*self.u*np.cos(self.mu) change mu into wavedir
+        return self.omega - ko*self.forward_speed*np.cos(self.wave_direction)
+
+    @property
+    def wavenumber_e(self):
+        #wave number of the encountered frequency
+        if self.depth == np.infty or self.omega_e**2*self.depth/self.g > 20:
+            return self.omega_e**2/self.g
+        else:
+            return newton(lambda x: x*np.tanh(x) - self.omega_e**2*self.depth/self.g, x0=1.0)/self.depth
+
+    @property
     def period(self):
         if self.omega == 0.0:
             return np.infty
@@ -237,12 +281,13 @@ class DiffractionProblem(LinearPotentialFlowProblem):
                  omega=_default_parameters['omega'],
                  rho=_default_parameters['rho'],
                  g=_default_parameters['g'],
-                 wave_direction=_default_parameters['wave_direction']):
+                 wave_direction=_default_parameters['wave_direction'],
+                 forward_speed=_default_parameters['forward_speed']):
 
         self.wave_direction = float(wave_direction)
 
         super().__init__(body=body, free_surface=free_surface, sea_bottom=sea_bottom,
-                         omega=omega, rho=rho, g=g)
+                         omega=omega, rho=rho,forward_speed=forward_speed, g=g)
 
         if not (-2*np.pi-1e-3 <= self.wave_direction <= 2*np.pi+1e-3):
             LOG.warning(f"The value {self.wave_direction} has been provided for the wave direction, and it does not look like an angle in radians. "
@@ -284,12 +329,15 @@ class RadiationProblem(LinearPotentialFlowProblem):
                  omega=_default_parameters['omega'],
                  rho=_default_parameters['rho'],
                  g=_default_parameters['g'],
-                 radiating_dof=None):
+                 radiating_dof=None,
+                 forward_speed=_default_parameters['forward_speed'],
+                 wave_direction=0.0):
 
         self.radiating_dof = radiating_dof
+        self.wave_direction = wave_direction
 
         super().__init__(body=body, free_surface=free_surface, sea_bottom=sea_bottom,
-                         omega=omega, rho=rho, g=g)
+                         omega=omega, rho=rho,forward_speed=forward_speed, g=g)
 
         if self.body is not None:
 
@@ -348,6 +396,14 @@ class LinearPotentialFlowResult:
         self.period             = self.problem.period
         self.body_name          = self.problem.body_name
         self.influenced_dofs    = self.problem.influenced_dofs
+        #####FORWARD SPEEDS REQUIRED VALUES
+        self.dphidx             = None
+        self.dphidx_U           = None
+        # self.potential_U        = None
+        self.omega_e            = self.problem.omega_e
+        self.wavenumber_e       = self.problem.wavenumber_e
+        self.forward_speed      = self.problem.forward_speed
+        self.rho                = self.problem.rho
 
         if forces is not None:
             for dof in self.influenced_dofs:
@@ -368,6 +424,28 @@ class DiffractionResult(LinearPotentialFlowResult):
 
     def store_force(self, dof, force):
         self.forces[dof] = 1j*self.omega*force
+
+    def store_force_forward_speed(self, dof, force):
+        '''
+        This function has been implemented by the Maritime Technology Division (MTD) of Ghent University, Belgium. 
+        L. Donatini, I. Herdayanditya, G. Verao Fernandez, A. B. K. Pribadi, E. Lataire, 
+        and G. Delefortrie, “Implementation of forward speed effects on an open source seakeeping 
+        solver,” in 6th MASHCON : international conference on ship manoeuvring in shallow and confined 
+        water with special focus on port manoeuvres, Glasgow, UK, 2022, pp. 20–33.
+        http://hdl.handle.net/1854/LU-8756868
+        '''
+        self.dof = dof
+          
+        influenced_dof_vectors = self.problem.influenced_dofs[self.dof]
+        influenced_dof_normal  = np.sum(influenced_dof_vectors * self.problem.body.mesh.faces_normals, axis=1)
+        
+        list_panel_area =self.body.mesh.faces_areas
+
+        forward_speed_correction = 0
+
+        forward_speed_correction = -self.rho*self.forward_speed*sum(influenced_dof_normal*self.dphidx*list_panel_area)
+
+        self.forces[dof] = 1j*self.omega_e*force + forward_speed_correction
 
     @property
     def records(self):
@@ -394,6 +472,31 @@ class RadiationResult(LinearPotentialFlowResult):
             self.radiation_dampings[dof] = 0
         else:
             self.radiation_dampings[dof] = self.problem.omega * force.imag
+
+    def store_force_forward_speed(self,dof,force):
+        '''
+        This function has been implemented by the Maritime Technology Division (MTD) of Ghent University, Belgium. 
+        L. Donatini, I. Herdayanditya, G. Verao Fernandez, A. B. K. Pribadi, E. Lataire, 
+        and G. Delefortrie, “Implementation of forward speed effects on an open source seakeeping 
+        solver,” in 6th MASHCON : international conference on ship manoeuvring in shallow and confined 
+        water with special focus on port manoeuvres, Glasgow, UK, 2022, pp. 20–33.
+        http://hdl.handle.net/1854/LU-8756868
+        '''
+        influenced_dof_vectors = self.problem.influenced_dofs[dof]
+        influenced_dof_normal  = np.sum(influenced_dof_vectors * self.problem.body.mesh.faces_normals, axis=1)
+        list_panel_area = self.body.mesh.faces_areas
+            
+        forward_speed_correction_1=  self.rho*self.forward_speed*sum(influenced_dof_normal*self.potential_U*list_panel_area) #steady component 1
+        forward_speed_correction_2= -self.rho*self.forward_speed*sum(influenced_dof_normal*self.dphidx*list_panel_area) #steady component 2
+        forward_speed_correction_3=  self.rho*self.forward_speed**2/(1j*self.omega_e)*sum(influenced_dof_normal*self.dphidx_U*list_panel_area) #steady component 3
+        
+        force = 1j*force*self.problem.omega_e + forward_speed_correction_1 + forward_speed_correction_2 + forward_speed_correction_3
+        
+        self.added_masses[dof] = force.imag/self.problem.omega_e
+        if self.problem.omega == np.infty:
+            self.radiation_dampings[dof] = 0
+        else:
+            self.radiation_dampings[dof] = -force.real
 
     @property
     def records(self):

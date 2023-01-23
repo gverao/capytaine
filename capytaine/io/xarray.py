@@ -65,7 +65,7 @@ def problems_from_dataset(dataset: xr.Dataset,
 
     # Warn user in case of key with unrecognized name (e.g. mispells)
     keys_in_dataset = set(dataset.keys()) | set(dataset.coords.keys())
-    accepted_keys = {'wave_direction', 'radiating_dof', 'body_name', 'omega', 'water_depth', 'rho', 'g'}
+    accepted_keys = {'wave_direction', 'radiating_dof', 'body_name', 'omega', 'water_depth', 'rho', 'g','forward_speed'}
     unrecognized_keys = keys_in_dataset.difference(accepted_keys)
     if len(unrecognized_keys) > 0:
         LOG.warning(f"Unrecognized key(s) in dataset: {unrecognized_keys}")
@@ -80,6 +80,7 @@ def problems_from_dataset(dataset: xr.Dataset,
     omega_range = dataset['omega'].data if 'omega' in dataset else [_default_parameters['omega']]
     water_depth_range = dataset['water_depth'].data if 'water_depth' in dataset else [_default_parameters['water_depth']]
     rho_range = dataset['rho'].data if 'rho' in dataset else [_default_parameters['rho']]
+    forward_speed_range = dataset['forward_speed'].data if 'forward_speed' in dataset else [_default_parameters['forward_speed']]
     g_range = dataset['g'].data if 'g' in dataset else [_default_parameters['g']]
 
     wave_direction_range = dataset['wave_direction'].data if 'wave_direction' in dataset else None
@@ -96,20 +97,35 @@ def problems_from_dataset(dataset: xr.Dataset,
 
     problems = []
     if wave_direction_range is not None:
-        for omega, wave_direction, water_depth, body_name, rho, g \
-                in product(omega_range, wave_direction_range, water_depth_range, body_range, rho_range, g_range):
+        for omega, wave_direction, water_depth, body_name, rho,forward_speed, g \
+                in product(omega_range, wave_direction_range, water_depth_range, body_range, rho_range,forward_speed_range, g_range):
             problems.append(
                 DiffractionProblem(body=body_range[body_name], omega=omega,
-                                   wave_direction=wave_direction, sea_bottom=-water_depth, rho=rho, g=g)
+                                   wave_direction=wave_direction, sea_bottom=-water_depth, rho=rho,forward_speed=forward_speed, g=g)
             )
+            
+        print('Diffraction input, with Forward Speed:'+str(forward_speed))
+            
+    if radiating_dofs is not None :
+        if forward_speed_range == 0:
+            for omega, radiating_dof, water_depth, body_name, rho,forward_speed, g \
+                    in product(omega_range, radiating_dofs, water_depth_range, body_range, rho_range,forward_speed_range, g_range):
+                problems.append(
+                    RadiationProblem(body=body_range[body_name], omega=omega,
+                                     radiating_dof=radiating_dof, sea_bottom=-water_depth, rho=rho,forward_speed=forward_speed, g=g)
+                )
+        else:
+        #TODO GENERALIZE TO SOLVE MULTIPLE WAVE DIRECTIONS NOW IT ONLY WORKS FOR ONE WAVE DIRECTION
+            for omega, radiating_dof, water_depth, body_name, rho,forward_speed, g \
+                    in product(omega_range, radiating_dofs, water_depth_range, body_range, rho_range,forward_speed_range, g_range):
+                problems.append(
+                    RadiationProblem(body=body_range[body_name], omega=omega,
+                                     radiating_dof=radiating_dof, sea_bottom=-water_depth, rho=rho,wave_direction=wave_direction,
+                                     forward_speed=forward_speed, g=g)
+                )
 
-    if radiating_dofs is not None:
-        for omega, radiating_dof, water_depth, body_name, rho, g \
-                in product(omega_range, radiating_dofs, water_depth_range, body_range, rho_range, g_range):
-            problems.append(
-                RadiationProblem(body=body_range[body_name], omega=omega,
-                                 radiating_dof=radiating_dof, sea_bottom=-water_depth, rho=rho, g=g)
-            )
+
+        print('Radiation input, with Forward Speed:'+str(forward_speed))
 
     return sorted(problems)
 
@@ -318,7 +334,7 @@ def assemble_dataset(results,
     if 'added_mass' in records.columns:
         records["radiating_dof"] = records["radiating_dof"].astype(rad_dof_cat)
 
-    optional_dims = ['g', 'rho', 'body_name', 'water_depth']
+    optional_dims = ['g', 'rho', 'body_name', 'water_depth', 'forward_speed']
 
     # RADIATION RESULTS
     if 'added_mass' in records.columns:
@@ -335,6 +351,12 @@ def assemble_dataset(results,
 
     # DIFFRACTION RESULTS
     if 'diffraction_force' in records.columns:
+        conventions = set(records['convention'].dropna())
+        if len(conventions) > 1:
+            LOG.warning("Assembling a dataset mixing several conventions.")
+        else:
+            attrs['incoming_waves_convention'] = conventions.pop()
+
         diffraction_cases = _dataset_from_dataframe(
             records,
             variables=['diffraction_force', 'Froude_Krylov_force'],

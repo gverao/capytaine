@@ -25,6 +25,7 @@ from capytaine.green_functions.delhommeau import Delhommeau
 from capytaine.bem.engines import BasicMatrixEngine, HierarchicalToeplitzMatrixEngine
 from capytaine.io.xarray import problems_from_dataset, assemble_dataset, kochin_data_array
 from capytaine.tools.optional_imports import silently_import_optional_dependency
+from capytaine.bem.velocity_potential import compute_dphidx,compute_phi_U_dphidx_U
 
 LOG = logging.getLogger(__name__)
 
@@ -77,11 +78,15 @@ class BEMSolver:
         LinearPotentialFlowResult
             an object storing the problem data and its results
         """
+        if problem.forward_speed == 0: 
+            wavenumber=problem.wavenumber
+        else: 
+            wavenumber=problem.wavenumber_e
         LOG.info("Solve %s.", problem)
 
         S, K = self.engine.build_matrices(
             problem.body.mesh, problem.body.mesh,
-            problem.free_surface, problem.sea_bottom, problem.wavenumber,
+            problem.free_surface, problem.sea_bottom, wavenumber,
             self.green_function
         )
         sources = self.engine.linear_solver(K, problem.boundary_condition)
@@ -97,6 +102,17 @@ class BEMSolver:
             result = problem.make_results_container(forces)
         else:
             result = problem.make_results_container(forces, sources, potential, pressure)
+
+        if  problem.forward_speed == 0:
+            for influenced_dof_name, influenced_dof_vectors in problem.influenced_dofs.items():
+                # Scalar product on each face:
+                influenced_dof_normal = np.sum(influenced_dof_vectors * problem.body.mesh.faces_normals, axis=1)
+                # Sum over all faces:                         
+                integrated_potential = - problem.rho * np.sum(potential * influenced_dof_normal * problem.body.mesh.faces_areas)
+                # Store result:
+                result.store_force(influenced_dof_name, integrated_potential)
+                # Depending of the type of problem, the force will be kept as a complex-valued Froude-Krylov force
+                # or stored as a couple of added mass and radiation damping coefficients.
 
         LOG.debug("Done!")
 
@@ -128,6 +144,7 @@ class BEMSolver:
             groups_of_problems = LinearPotentialFlowProblem._group_for_parallel_resolution(problems)
             groups_of_results = joblib.Parallel(n_jobs=n_jobs)(joblib.delayed(self.solve_all)(grp, n_jobs=1, **kwargs) for grp in groups_of_problems)
             results = [res for grp in groups_of_results for res in grp]  # flatten the nested list
+            
             return results
 
     def fill_dataset(self, dataset, bodies, *, n_jobs=1, **kwargs):
@@ -156,9 +173,26 @@ class BEMSolver:
             kochin = kochin_data_array(results, dataset.coords['theta'])
             dataset = assemble_dataset(results, attrs=attrs, **kwargs)
             dataset.update(kochin)
-        else:
-            results = self.solve_all(problems, keep_details=False, n_jobs=n_jobs)
+        else:        
+            if 'forward_speed' in dataset.coords and dataset.forward_speed !=0:
+                results = self.solve_all(problems, keep_details=True, n_jobs=n_jobs)
+                results   = compute_dphidx(problems,results)
+                results   = compute_phi_U_dphidx_U(results)
+                for result in results:
+                    for influenced_dof_name, influenced_dof_vectors in result.problem.influenced_dofs.items():
+                        # Scalar product on each face:
+                        influenced_dof_normal = np.sum(influenced_dof_vectors * result.problem.body.mesh.faces_normals, axis=1)
+                        # Sum over all faces:                         
+                        integrated_potential = - result.problem.rho * np.sum(result.potential * influenced_dof_normal * result.problem.body.mesh.faces_areas)
+                        # Store result:
+
+                        result.store_force_forward_speed(influenced_dof_name, integrated_potential)
+                        # Depending of the type of problem, the force will be kept as a complex-valued Froude-Krylov force
+                        # or stored as a couple of added mass and radiation damping coefficients. 
+            else:
+                results = self.solve_all(problems, keep_details=False, n_jobs=n_jobs)
             dataset = assemble_dataset(results, attrs=attrs, **kwargs)
+        
         return dataset
 
     def get_potential_on_mesh(self, result, mesh, chunk_size=50):
@@ -259,7 +293,7 @@ class Nemoh(BEMSolver):
     def __init__(self, **params):
         green_function = Delhommeau(
            **{key: params[key] for key in params if key in _arguments(Delhommeau.__init__)}
-	)
+    )
         if 'hierarchical_matrices' in params and params['hierarchical_matrices']:
             engine = HierarchicalToeplitzMatrixEngine(
                **{key: params[key] for key in params if key in _arguments(HierarchicalToeplitzMatrixEngine.__init__)}
